@@ -28,6 +28,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.net.URLEncoder
 import java.time.LocalDate
 import java.time.OffsetDateTime
@@ -58,7 +59,14 @@ class Nakanime :
 
     /** Solves Cloudflare challenges via WebView and reuses the clearance cookie. */
     override val client = network.client.newBuilder()
-        .addNetworkInterceptor(CloudflareInterceptor(network.client))
+        .addInterceptor(CloudflareInterceptor(network.client))
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (!isSafeUrl(request.url.toString())) {
+                throw IOException("Blocked unsafe URL: ${request.url}")
+            }
+            chain.proceed(request)
+        }
         .build()
 
     /** Cache of `animeId -> season numbers`. */
