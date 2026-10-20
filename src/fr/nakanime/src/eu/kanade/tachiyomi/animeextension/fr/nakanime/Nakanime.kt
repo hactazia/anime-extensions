@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.fr.nakanime
 
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -20,6 +21,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -56,7 +58,7 @@ class Nakanime :
 
     /** Solves Cloudflare challenges via WebView and reuses the clearance cookie. */
     override val client = network.client.newBuilder()
-        .addInterceptor(CloudflareInterceptor(network.client))
+        .addNetworkInterceptor(CloudflareInterceptor(network.client))
         .build()
 
     /** Cache of `animeId -> season numbers`. */
@@ -73,20 +75,20 @@ class Nakanime :
 
         if (!fromHtml.isNullOrEmpty()) return fromHtml
 
-        return runCatching { scheduleEpisodes(anime) }.getOrDefault(emptyList())
+        return scheduleEpisodes(anime)
     }
 
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/api/catalog/search?sort=popularity&page=$page&per_page=32", apiHeaders)
 
-    override fun popularAnimeParse(response: Response): AnimesPage = parseAnimesPage(response)
+    override fun popularAnimeParse(response: Response): AnimesPage = parseAnimesPage(response, splitSeasons = true)
 
     // =============================== Latest ===============================
 
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/api/catalog/search?sort=trending&page=$page&per_page=32", apiHeaders)
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = parseAnimesPage(response)
+    override fun latestUpdatesParse(response: Response): AnimesPage = parseAnimesPage(response, splitSeasons = true)
 
     // =============================== Search ===============================
 
@@ -116,13 +118,11 @@ class Nakanime :
         val root = JSONObject(response.decrypted())
         val data = root.optJSONArray("data") ?: JSONArray()
 
-        var fallback: JSONObject? = null
         for (i in 0 until data.length()) {
             val item = data.getJSONObject(i)
-            if (fallback == null) fallback = item
             if (item.optString("id") == wantedId) return animeFromJson(item).withSeason(season)
         }
-        return fallback?.let { animeFromJson(it).withSeason(season) } ?: SAnime.create()
+        error("Anime $wantedId not found in catalog results")
     }
 
     private fun SAnime.withSeason(season: Int?): SAnime = if (season == null) {
@@ -249,13 +249,15 @@ class Nakanime :
     }
 
     private fun collectSchedule(body: String, animeId: String, out: MutableMap<Long, RawEpisode>) {
-        val now = System.currentTimeMillis()
+        val startOfToday = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
         val days = runCatching { JSONObject(body).optJSONArray("days") }.getOrNull() ?: return
 
         for (d in 0 until days.length()) {
             val day = days.getJSONObject(d)
             val dayMillis = parseDay(day.optString("date"))
-            if (dayMillis > now) continue
+            // The schedule only exposes a date: skip today to avoid listing episodes
+            // that have not aired yet. The HTML path uses airedAt/hasSources instead.
+            if (dayMillis >= startOfToday) continue
 
             val eps = day.optJSONArray("episodes") ?: continue
             for (i in 0 until eps.length()) {
@@ -285,6 +287,12 @@ class Nakanime :
 
         val result = if (mergeSeasons) {
             // Continuous numbering across all seasons.
+            ordered.mapIndexed { index, raw ->
+                raw.toEpisode(animeId, (index + 1).toFloat(), index + 1, showSeason = true)
+            }
+        } else if (ordered.map { it.season }.distinct().size > 1) {
+            // The entry was not split by season (e.g. split lookup failed): keep
+            // seasons distinguishable and avoid duplicate episode numbers.
             ordered.mapIndexed { index, raw ->
                 raw.toEpisode(animeId, (index + 1).toFloat(), index + 1, showSeason = true)
             }
@@ -329,6 +337,31 @@ class Nakanime :
         }
     }
 
+    /** Reject non-HTTPS and local/private hosts returned by the API. */
+    private fun isSafeUrl(url: String): Boolean {
+        val parsed = url.toHttpUrlOrNull() ?: return false
+        if (parsed.scheme != "https") return false
+        if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return false
+        if (parsed.port != 443) return false
+
+        val host = parsed.host
+        if (host == "localhost" || host.endsWith(".localhost")) return false
+        if (host.contains(':')) return false
+        if (!host.matches(IPV4_REGEX)) return true
+
+        val parts = host.split('.').map { it.toIntOrNull() ?: return false }
+        val first = parts[0]
+        val second = parts[1]
+        return !(
+            first == 0 || first == 10 || first == 127 ||
+                (first == 100 && second in 64..127) ||
+                (first == 169 && second == 254) ||
+                (first == 172 && second in 16..31) ||
+                (first == 192 && second == 168) ||
+                first >= 224
+            )
+    }
+
     private fun apiGet(path: String): String = network.client.newCall(GET(baseUrl + path, apiHeaders)).execute().use { response ->
         if (!response.isSuccessful) error("HTTP ${response.code}")
         response.decrypted()
@@ -365,12 +398,14 @@ class Nakanime :
             langPref == "all" || it.optString("language").equals(langPref, ignoreCase = true)
         }
 
-        return matching.ifEmpty { servers }.map { server ->
+        return matching.ifEmpty { servers }.mapNotNull { server ->
             val host = server.optString("host").ifBlank { "source" }
             val language = server.optString("language")
+            val url = server.optString("url")
+            if (!isSafeUrl(url)) return@mapNotNull null
             Hoster(
                 hosterName = "[$language] $host",
-                hosterUrl = server.optString("url"),
+                hosterUrl = url,
                 internalData = host,
             )
         }
@@ -382,7 +417,10 @@ class Nakanime :
         val extractor = preferences.getString(PREF_EXTRACTOR_KEY, PREF_EXTRACTOR_DEFAULT) ?: PREF_EXTRACTOR_DEFAULT
         if (extractor == PREF_EXTRACTOR_DEFAULT) return this
 
-        return sortedWith(compareByDescending { it.hosterName.contains(extractor, ignoreCase = true) })
+        val wanted = extractor.replace(".", "").lowercase(Locale.ROOT)
+        return sortedWith(
+            compareByDescending { it.internalData.replace(".", "").lowercase(Locale.ROOT) == wanted },
+        )
     }
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> = when (hoster.internalData.lowercase(Locale.ROOT)) {
@@ -441,10 +479,14 @@ class Nakanime :
         return AnimesPage(animes, page < lastPage)
     }
 
-    /** One entry per season for search results. */
-    private fun List<SAnime>.splitBySeason(): List<SAnime> = parallelCatchingFlatMapBlocking { anime ->
-        val seasons = runCatching { fetchSeasonNumbers(anime) }.getOrDefault(emptyList())
-        if (seasons.size <= 1) listOf(anime) else seasons.map { anime.asSeason(it) }
+    /** One entry per season for catalog results when season merging is disabled. */
+    private fun List<SAnime>.splitBySeason(): List<SAnime> = chunked(SEASON_LOOKUP_CONCURRENCY).flatMap { chunk ->
+        chunk.parallelCatchingFlatMapBlocking { anime ->
+            val seasons = runCatching { fetchSeasonNumbers(anime) }
+                .onFailure { Log.e("Nakanime", "Season lookup failed for ${anime.title}", it) }
+                .getOrDefault(emptyList())
+            if (seasons.size <= 1) listOf(anime) else seasons.map { anime.asSeason(it) }
+        }
     }
 
     private fun fetchSeasonNumbers(anime: SAnime): List<Int> {
@@ -573,7 +615,8 @@ class Nakanime :
     companion object {
         private const val SALT = "nkapiv1"
         private const val KEY_SIZE = 32
-        private const val MAX_SCHEDULE_WINDOWS = 60
+        private const val MAX_SCHEDULE_WINDOWS = 160
+        private const val SEASON_LOOKUP_CONCURRENCY = 8
 
         private const val PREF_EXTRACTOR_KEY = "preferred_extractor"
         private const val PREF_EXTRACTOR_DEFAULT = "auto"
@@ -583,5 +626,6 @@ class Nakanime :
         private val ANIME_DATA_REGEX = Regex("""<script[^>]*id="anime-data"[^>]*>([\s\S]*?)</script>""")
         private val EPISODE_TITLE_REGEX = Regex("(?i)^(épisode|episode)\\s*\\d+$")
         private val SEASON_SUFFIX_REGEX = Regex("""\s+-\s+Saison\s+\d+$""")
+        private val IPV4_REGEX = Regex("""\d{1,3}(\.\d{1,3}){3}""")
     }
 }
